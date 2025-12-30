@@ -1,28 +1,29 @@
+from src.polytope import Polytope
+import jax.numpy as jnp
 import numpy as np
-import polytope as pc
-try:
-    print("Polytope version:", pc.__version__)
-except:
-    print("No version")
 
-# Test H -> V
-A = np.array([[-1, 0], [0, -1], [1, 0], [0, 1]]) # Box [-1, 1]^2
-b = np.array([1, 1, 1, 1])
-p = pc.Polytope(A, b)
-print("Created Polytope")
+def test_polytope():
+    # 1. Box creation
+    print("Testing Box...")
+    p = Polytope.box(2, (jnp.zeros(2), jnp.ones(2)))
+    assert p.A.shape == (4, 2)
+    assert p.b.shape == (4,)
+    
+    # 2. Check contains
+    print("Testing Contains...")
+    assert p.contains(jnp.array([0.5, 0.5]))
+    assert not p.contains(jnp.array([1.5, 0.5]))
+    
+    # 3. Empitness
+    print("Testing Empty...")
+    assert not p.is_empty()
+    
+    # 4. Infeasible Intersection
+    p_far = Polytope.box(2, (jnp.array([2.0, 2.0]), jnp.array([3.0, 3.0])))
+    p_int = p.intersect(p_far)
+    assert p_int.is_empty()
+    
+    print("All Polytope tests passed.")
 
-try:
-    v = pc.extreme(p)
-    print("Vertices from pc.extreme:", v)
-except Exception as e:
-    print("pc.extreme failed:", e)
-
-# Test V -> H
-V = np.array([[1, 1], [1, -1], [-1, 1], [-1, -1]])
-try:
-    p2 = pc.qhull(V)
-    print("H-rep from pc.qhull:", p2)
-    print("A:", p2.A)
-    print("b:", p2.b)
-except Exception as e:
-    print("pc.qhull failed:", e)
+if __name__ == "__main__":
+    test_polytope()

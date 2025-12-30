@@ -98,13 +98,16 @@ def analyze_trees(tree_dir='runs/trees'):
                          queue.append(c)
 
         # Rigorous Mass Calculation (MiniMax)
-        # We re-compute it to be sure, or trust what was logged? 
-        # Better to recompute from tree to verify the new logic works on saved trees.
         try:
-            safe_mass = solver.compute_safe_probability(solver.root)
+            # Check for new method signature or property
+            if hasattr(solver, 'compute_safe_probability'):
+                 safe_mass_lower_bound = solver.compute_safe_probability(solver.root)
+            else:
+                 # Fallback if method missing (shouldn't happen with updated search.py)
+                 safe_mass_lower_bound = 0.0
         except Exception as e:
             print(f"Error computing mass for {fpath.name}: {e}")
-            safe_mass = 0.0
+            safe_mass_lower_bound = 0.0
 
         # Normalize splits by number of nodes (average splits per branch)
         n_branches = len(sample_nodes) if len(sample_nodes) > 0 else 1
@@ -119,7 +122,8 @@ def analyze_trees(tree_dir='runs/trees'):
             'avg_relu_splits': relu_splits / n_branches,
             'avg_action_splits': action_splits / n_branches,
             'avg_z_splits': z_splits / n_branches,
-            'safe_mass': safe_mass # Added safe_mass
+            'safe_mass_lower_bound': safe_mass_lower_bound,
+            'mass_efficiency': safe_mass_lower_bound / (nodes + 1e-9)
         })
 
     df = pl.DataFrame(data)
@@ -147,7 +151,7 @@ def analyze_trees(tree_dir='runs/trees'):
 
     # 3. Safe Mass per Loop (The Key Metric)
     plt.figure()
-    sns.boxplot(data=df.to_pandas(), x="loop", y="safe_mass")
+    sns.boxplot(data=df.to_pandas(), x="loop", y="safe_mass_lower_bound")
     plt.title("Lower Bound Safe Probability per Loop")
     plt.savefig("analysis_safe_mass_per_loop.png")
     plt.close()

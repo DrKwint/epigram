@@ -1,52 +1,50 @@
-# Lab Notebook: Active Learning & Reachability Analysis
+# Lab Notebook: Executive Summary
 
-## Verification: Calibration Check
-**Date:** 2025-12-30
-**Goal:** Verify ENN is calibrated before optimizing search.
+**Project**: Robust MPC with ENNs & Zonotopes
+**Target Venue**: CAV / NeuS / L4DC
 
-### Results
-*   **ECE (Sigma vs Error):** 0.0357 (Target < 0.1). **PASS**.
-    *   The model's predicted uncertainty closely matches its actual error rate.
-*   **AUROC (ID vs OOD):** 0.7948 (Target > 0.6). **PASS**.
-    *   The model reliably outputs higher uncertainty for OOD data.
-*   **OOD/ID Sigma Ratio:** 1.53.
-    *   OOD data is ~50% more uncertain than training data.
+## Current Status: Experiment 2 (Horizon 10)
+**Date**: 2025-12-30
 
-**Conclusion:** The model provides a valid signal for "safe" vs "unsafe/unknown" regions. We can proceed with maximizing safe probability.
+### Key Findings
+1.  **Calibration Verified**: The ENN is well-calibrated (ECE < 0.04), providing valid safety signals.
+2.  **Search Depth**: Experiment 1 (Horizon 6) showed the agent consistently surviving *only* to the horizon. We are now testing **Horizon 10**.
+3.  **Visualization**: We have implemented a pipeline to plot 2D "Reachable Tubes" (`visualize_reachability.py`) to visually demonstrate safety guarantees.
 
-## Experiment 1: Baseline Active Learning
-**Date:** 2025-12-29
-**Goal:** Run the existing active learning loop, capture search trees, and establish a baseline for learning speed (episode length) and search efficiency.
+### Next Steps
+1.  **Analyze Horizon 10**: Once Experiment 2 completes, run `analyze_trees.py`.
+2.  **Generate Figures**: Run `visualize_reachability.py` on the new trees.
+3.  **Synthesize**: Determine if "Prioritized DFS" successfully enables deep search without exponential blowup.
 
-### Configuration
-*   **Env:** InvertedPendulum-v5
-*   **Loops:** 5
-*   **Episodes per Loop:** 5
-*   **MPC Horizon:** 6
-*   **Solver:** ReachabilitySolver (ENN-based)
+---
 
-### Modifications
-*   Modified `active_learning.py` to save `ReachabilitySolver` objects from the first step of each episode to `runs/trees/`.
+## Past Experiments
 
-### Results
-*   **Learning Progress:** Average reward improved from 2.4 (Loop 0) to 5.2 (Loop 3) but plateaued around 5.0.
-*   **Episode Length:** Capped by the short MPC horizon (6) and "safety" failures. The agent survives ~5 steps, which is close to the lookahead horizon.
-*   **Search Statistics:**
-    *   **Depth:** Increased from max 2 (Loop 0) to 5 (Loop 4).
-    *   **ReLU Splits:** Decreased significantly from ~11.8 to ~6.0 per branch. This suggests the learned model became "simpler" or more linear in the relevant state space as training progressed.
-    *   **Z Splits:** Decreased from ~2.2 to ~0.7 per branch, indicating reduced epistemic uncertainty (or uncertainty regions that don't cross decision boundaries).
-    *   **Action Splits:** Remained steady at ~0.8 per branch.
+### Experiment 1: Baseline (Horizon 6)
+- **Result**: Agent learned but performance was capped by short horizon.
+- **Insight**: Search complexity (ReLU splits) decreased over time, suggesting the model learns to be "easier to verify" in relevant regions.
 
-### Analysis & Recommendations
-1.  **Short Horizon Limiting Performance:** The agent consistently survives to ~5 steps, matching the MPC horizon of 6. To achieve longer episodes (e.g., 100+ steps), we MUST increase the MPC horizon.
-2.  **Search Optimization:**
-    *   **ReLU Splits** are the dominant cost. The reduction over time is promising.
-    *   **Low Z-Splits** in later loops suggests we could reduce the number of Z-dimensions or splits allocated to Z, focusing more on Action/ReLU to reach deeper depths.
-3.  **Optimization Proposal:**
-    *   Increase `MPC_HORIZON` to 10 or 15.
-    *   To offset variable computational cost, we might limit `max_splits` or use a "Safe Mass" heuristic earlier.
+*For full details, logs, and configuration, see [Research Log](research_log.md).*
 
-### Figures
-![Learning Curve](analysis_learning_curve.png)
-![Node Exploration](analysis_nodes_per_loop.png)
-![Split Types](analysis_split_types.png)
+---
+
+## Scientific Strategy: Advanced Search & Hybrid Geometry
+
+**Date**: 2025-12-30
+
+### 1. Hybrid Representation for Robust RRT
+To enable rigorous randomized search strategies (like RRT), we are adopting a **Hybrid Geometric Representation**:
+- **Forward Reachability (State $X$)**: Maintained as **Zonotopes**.
+    - *Rationale*: Neural network propagation is only computationally feasible with zonotopes (or similar centrally symmetric sets) due to the explosion of complexity with polytopes.
+- **Inverse Constraints (Parameters $Z$)**: Maintained as **Polytopes** ($Hz \le d$).
+    - *Rationale*: The "validity domain" of epistemic parameters for a specific trajectory is defined by the intersection of linear safety constraints mapped back from the output space. These are arbitrary half-spaces, not axis-aligned boxes.
+    - *Integration*: When propagating forward, we will over-approximate the $Z$-Polytope as a Zonotope to feed into the `AbstractENN`.
+
+### 2. Search Node Abstraction
+We are refactoring `SearchNode` to be a **Strategy-Agnostic Container** representing a "State of Knowledge" at depth $t$:
+> "Under the constraints $C$ (defining valid $Z$ and action history $u_{0:t}$), the system state is guaranteed to be within Zonotope $X_t$."
+
+### 3. Modular Search Strategies
+We will implement two distinct strategies sharing this core abstraction:
+1.  **`CompletePrioritizedDFS`** (Current): Exhaustive branching on Action/ReLU/Z to find *guaranteed* safe volumes.
+2.  **`RRTStrategy`** (New): Randomized exploration of the action space, using inverse constraints to identify the *subset of model parameters* for which the sampled trajectory is safe. This effectively turns the search from "finding a safe action for *all* models" to "finding a safe action for *some* models and quantifying their probability."

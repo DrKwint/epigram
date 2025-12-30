@@ -1,14 +1,34 @@
+from __future__ import annotations
+
 import heapq
-from typing import List, Optional, Tuple, Union, Dict
-from dataclasses import dataclass, replace, field
+import random
+from dataclasses import dataclass, field, replace
+from typing import Dict, List, Optional, Tuple, Union
+
 import jax
 import jax.numpy as jnp
 import numpy as np
-import random
 from flax import nnx
-from src.zono import GeneratorGroup, SensitivityResult, Zonotope, box_to_zonotope, AbstractENN
+from jaxtyping import Array, Float
+
+from src.net import ENN
+from src.zono import AbstractENN, GeneratorGroup, SensitivityResult, Zonotope, box_to_zonotope
+from src.polytope import Polytope
 
 MAX_STEPS = 10
+
+class SearchStrategy:
+    """
+    Abstract base class for search strategies.
+    Decides how to expand a node into children.
+    """
+    def step(self, solver: 'ReachabilitySolver', node: 'SearchNode') -> List['SearchNode']:
+        """
+        Produce child nodes from the current node.
+        Returns a list of new nodes to add to the queue.
+        If empty list, the branch is terminated (pruned or safe leaf).
+        """
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
@@ -20,42 +40,72 @@ class ConstraintState:
     # Action Bounds: ((min_vals...), (max_vals...))
     action_bounds: Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]] = None
     
-    # Z Bounds: ((min_vals...), (max_vals...))
+    # Z Bounds: ((min_vals...), (max_vals...)) - Legacy/Fast Box Constraints
     z_bounds: Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]] = None
+    
+    # Z Polytope: Polytope(hz <= d) - Rigorous Linear Constraints
+    z_polytope: Optional[Polytope] = None
     
     # ReLU Splits: Map layer_name -> ((neuron_idx, 'active'|'inactive'), ...)
     # Stored as tuple-of-tuples to be hashable
     relu_splits: Dict[str, Tuple[Tuple[int, str], ...]] = field(default_factory=dict)
-
-    @property
-    def probability_mass(self) -> float:
-        """Estimates volume of the Z-box (proxy for probability)."""
-        if self.z_bounds is None: return 1.0
+    
+    def probability_mass(self, z_dim: int = 1, z_range: float = 6.0) -> float:
+        """
+        Estimates volume of the Z-set (proxy for probability).
+        Order of precedence:
+        1. z_polytope (Rigorous)
+        2. z_bounds (Fast)
+        3. Unconstrained (1.0)
+        """
+        total_vol = z_range ** z_dim
+        
+        # 1. Polytope Volume (Approximate via Cheby Ball or Sampling?)
+        # Exact volume of high-dim polytope is #P-hard.
+        # Cheap proxy: Volume of Bounding Box of Polytope?
+        # Or just use the Box constraints if they exist?
+        
+        # For now, if we have a polytope, we assume it refines the box.
+        # But calculating its volume is hard.
+        # Let's fallback to the z_bounds volume if available, 
+        # or if z_polytope is present but no bounds, return a heuristic?
+        
+        # Refined Plan: 'z_bounds' should always track the Bounding Box of 'z_polytope'.
+        # If we add a linear constraint, we should update the BB.
+        
+        if self.z_bounds is None:
+            return 1.0
+            
         mins, maxs = self.z_bounds
-        # Simple volume calculation
-        diffs = jnp.array(maxs) - jnp.array(mins)
-        vol = float(jnp.prod(diffs))
-        # Total volume for 4 dims [-3, 3] is 6^4 = 1296.0
-        return vol / 1296.0
+        diffs = np.array(maxs) - np.array(mins)
+        
+        # Clip negative volumes (infeasible)
+        diffs = np.maximum(diffs, 0.0)
+        
+        vol = float(np.prod(diffs))
+        return vol / max(total_vol, 1e-9)
+
 
 @dataclass(order=True, frozen=True)
 class SearchNode:
-    priority: Tuple[int, float] # (-timestep, -mass) -> Deepest then Highest Mass
+    priority: Tuple[int, float] = field(compare=True) # (-timestep, -mass)
     timestep: int = field(compare=False)
     zonotope: Zonotope = field(compare=False)
     z_zonotope: Optional[Zonotope] = field(compare=False, default=None)
     parent: Optional['SearchNode'] = field(compare=False, default=None)
     constraints: ConstraintState = field(compare=False, default_factory=ConstraintState)
     
-    def __post_init__(self):
-        # Auto-calculate priority if missing.
-        # Prioritized DFS: Deepest first (-timestep), then highest mass (-mass)
-        # We use a Min-Heap, so negative values ensure Max behavior.
-        if isinstance(self.priority, float) and self.priority == 0.0:
-            object.__setattr__(self, 'priority', (-self.timestep, -self.constraints.probability_mass))
-
+    # We remove __post_init__ to force explicit priority calculation by the Solver.
+    
 class ReachabilitySolver:
-    def __init__(self, model: AbstractENN, unsafe_direction: jax.Array, unsafe_threshold: float, target_safe_prob: Optional[float] = None, verbosity: int = 2):
+    def __init__(
+        self, 
+        model: AbstractENN, 
+        unsafe_direction: Float[Array, "out"], 
+        unsafe_threshold: float, 
+        target_safe_prob: Optional[float] = None, 
+        verbosity: int = 2
+    ):
         self.model = model
         self.unsafe_h = unsafe_direction
         self.unsafe_thresh = unsafe_threshold
@@ -69,14 +119,15 @@ class ReachabilitySolver:
         # Track best node for fallback (deepest, then highest probability mass)
         self.best_node: Optional[SearchNode] = None
         
-        # Track explored nodes for graph reconstruction (if needed)
-        # Map: node_id -> node? No, just keep parent pointers.
-        # But for "MiniMax" aggregation, we need to traverse the tree from Root down?
-        # Or Root up? 
-        # Actually, SearchNode object is the state. If we keep the Root, we can traverse it.
         self.root: Optional[SearchNode] = None
         self.children_map: Dict[SearchNode, List[SearchNode]] = {} # Parent -> Children
         self.split_type_map: Dict[SearchNode, str] = {} # Node -> SplitType that created its children
+        
+        # Default Strategy: CompletePrioritizedDFS
+        self.strategy: SearchStrategy = CompletePrioritizedDFS()
+
+    def set_strategy(self, strategy: SearchStrategy):
+        self.strategy = strategy
 
     def push(self, node: SearchNode):
         if self.root is None and node.timestep == 0:
@@ -90,278 +141,130 @@ class ReachabilitySolver:
                 self.children_map[node.parent] = []
             self.children_map[node.parent].append(node)
 
-    def is_safe(self, zono: Zonotope) -> bool:
-        """
-        Checks if zonotope intersects the unsafe set (h^T x > d).
-        Returns True if the Upper Bound of projection is <= threshold.
-        """
-        _, ub = zono.project_bounds(self.unsafe_h)
-        # We take max over batch (though usually batch=1 in search)
-        max_ub = jnp.max(ub)
-        return float(max_ub) <= self.unsafe_thresh
+class CompletePrioritizedDFS(SearchStrategy):
+    """
+    Existing rigorous strategy:
+    1. Check Safety.
+    2. If Safe, propagate (keeping Z-constraints).
+    3. If Unsafe, perform Sensitivity Analysis and split (Action, Z, ReLU).
+    4. Prioritize branches by Depth then Mass.
+    """
 
-    def step(self) -> bool:
-        """
-        Executes one iteration of the BFS loop.
-        Returns False if queue is empty (done).
-        """
-        if not self.queue:
-            return False
 
-        current_node = heapq.heappop(self.queue)
-        
-        self.nodes_explored += 1
-        
-        # Track Best Node
-        if self.best_node is None:
-            self.best_node = current_node
-        else:
-            # Criteria: Deeper is better. If same depth, higher PROB MASS is better.
-            if current_node.timestep > self.best_node.timestep:
-                self.best_node = current_node
-            elif current_node.timestep == self.best_node.timestep:
-                if current_node.constraints.probability_mass > self.best_node.constraints.probability_mass:
-                    self.best_node = current_node
-        
-        if self.nodes_explored % 10 == 0 and self.verbosity >= 2:
-            print(f"Step {self.nodes_explored}: Queue Size {len(self.queue)}, Safe Leaves {len(self.safe_leaves)}")
-            
+class RRTStrategy(SearchStrategy):
+    """
+    Randomized exploration:
+    1. Sample random concrete action.
+    2. Propagate forward (keeping all Z).
+    3. Check Safety:
+       - If Safe: Keep all Z.
+       - If Unsafe: Calculate Valid Z-Polytope (Inverse Set).
+    """
+    def step(self, solver: 'ReachabilitySolver', node: 'SearchNode') -> List['SearchNode']:
         # 1. Horizon Check
-        if current_node.timestep >= MAX_STEPS:
-            self.safe_leaves.append(current_node)
-            # Do NOT return True (early stop). Continue searching to accumulate mass.
-            # But stop expanding this branch.
-            return True
+        if node.timestep >= solver.MAX_STEPS:
+            solver.safe_leaves.append(node)
+            return []
             
-            # Early Stopping Check (removed for Exhaustive Search)
-            # if self.target_safe_prob is not None: ...
-            
-            return True
-
-        # 2. Safety Check
-        is_safe_val = self.is_safe(current_node.zonotope)
-        # print(f"  [Trace] Step {self.nodes_explored}: Safe={is_safe_val} t={current_node.timestep}")
+        # 2. Sample Random Action
+        # Assuming action space is [-1, 1] per dimension for now, or use solver defaults
+        act_dim = solver.model.act_dim
+        key = jax.random.PRNGKey(random.randint(0, 100000))
+        u_sample = jax.random.uniform(key, (act_dim,), minval=-3.0, maxval=3.0) # Using wider range to find solutions?
         
-        if is_safe_val:
-            # Node is Safe -> Propagate forward to t+1
-            # We start with FRESH constraints for the next step (unless we want to inherit global ones)
-            # For this algo, we assume Action/ReLU constraints are local to the step, 
-            # but Z constraints are global.
-            
-            # Create next step constraints inheriting ONLY Z
-            next_constraints = ConstraintState(z_bounds=current_node.constraints.z_bounds)
-            self._propagate(current_node, next_constraints)
-        else:
-            # Node is Unsafe -> Refine the transition that created it
-            # print(f"  [Unsafe] Node at t={current_node.timestep}. Refining...")
-            self._refine(current_node)
-            
-        return True
-
-    def _propagate(self, parent_node: SearchNode, constraints: ConstraintState):
-        """
-        Runs the model forward one step using specific constraints.
-        [Parent State] + [Constrained Action] + [Constrained Z] -> [Child State]
-        """
-        # 1. Recover Z Zonotope (Threaded)
-        if parent_node.z_zonotope is not None:
-             z_input = parent_node.z_zonotope
-        else:
-             # Fallback/Root initialization (assumed unconstrained/default if not set)
-             z_input = self._get_constrained_z(constraints)
-
-        # 2. Apply Z Constraints via Generator Restriction
-        # If the constraints define tighter Z bounds than the parent's Z was built with,
-        # we must restrict the generators of BOTH x (state) and z (input).
+        # Create Action Constraints (Concrete Point)
+        u_tuple = tuple(u_sample.tolist())
+        c_action = replace(node.constraints, action_bounds=(u_tuple, u_tuple))
         
-        # We assume Z is initially a Box centered at 0 or whatever _get_constrained_z gave at Root.
-        # To map absolute bounds [a, b] to relative [-1, 1], we need the BASELINE Z props.
-        # Ideally, we should store z_baseline in the solver or node.
-        # Approximation: We assume z_input matches the *parent's* constraints.
-        # We need to apply the DELTA from parent constraints to current constraints.
+        # 3. Propagate (One Step)
+        # Reuse DFS propagation logic but for a point action
+        # Note: DFS propagate handles constraints. We can reuse it or call specific helpers.
+        # Let's reuse a simplified version to avoid duplicating the Z-alignment logic.
+        # But we need to handle the "Unsafe but Recoverable" case differently.
         
-        restrictions = []
-        if constraints.z_bounds and parent_node.constraints.z_bounds:
-            p_mins, p_maxs = parent_node.constraints.z_bounds
-            c_mins, c_maxs = constraints.z_bounds
-            
-            for i in range(len(p_mins)):
-                # If bounds tightened
-                if c_mins[i] > p_mins[i] or c_maxs[i] < p_maxs[i]:
-                    # Find the generator index for Z dimension i.
-                    # We assume Z history is simple: [GeneratorGroup('z', start, count)]
-                    # We search z_input history
-                    gen_idx = -1
-                    base_radius = 1.0 
-                    base_center = 0.0
-                    
-                    found = False
-                    for g in z_input.history:
-                        if g.source_type == 'z':
-                            # Assuming Z dims map 1-to-1 to generators in order
-                            if 0 <= i < g.count:
-                                gen_idx = g.start_idx + i
-                                
-                                # Retrieve current geometry of this generator from z_input
-                                # Center[i] ?? No, z_input center is [Batch, Dim]
-                                # But generators are [Batch, N, Dim]
-                                # For a Box Z, Z_i = c_i + g_idx_i * eps
-                                # We need (new_min - current_center)/current_radius
-                                
-                                # Current projected bounds of this dimension:
-                                # We can't easily invert the zonotope.
-                                # BUT we know Z is a box source.
-                                # The generator logic: restrict_generators takes [-1, 1] relative fractions.
-                                # So we need to know what [-1, 1] corresponds to in PROPERTY space.
-                                # Wait, if z_input has already been restricted, its "[-1, 1]" is a subset of the original.
-                                # "restrict_generators" restricts the *current* generator (which defines the current [-1,1] range)
-                                # to a subset.
-                                
-                                # Relative split:
-                                # New interval [L_new, R_new] is sub-segment of [L_old, R_old].
-                                # We map [L_old, R_old] -> [-1, 1].
-                                # frac_min = -1 + 2 * (c_min - p_min) / (p_max - p_min)
-                                # frac_max = -1 + 2 * (c_max - p_min) / (p_max - p_min)
-                                
-                                width = p_maxs[i] - p_mins[i]
-                                if width > 1e-9:
-                                    frac_min = -1.0 + 2.0 * (c_mins[i] - p_mins[i]) / width
-                                    frac_max = -1.0 + 2.0 * (c_maxs[i] - p_mins[i]) / width
-                                    
-                                    # Clip for safety
-                                    frac_min = max(-1.0, frac_min)
-                                    frac_max = min(1.0, frac_max)
-                                    
-                                    restrictions.append((gen_idx, frac_min, frac_max))
-                                found = True
-                                break
-                    if not found:
-                        print(f"Warning: Could not find generator for Z dim {i}")
-
-        # Apply restrictions
-        if restrictions:
-             # Apply to Z (Input)
-             z_constrained = z_input.restrict_generators(restrictions)
-             # Apply to X (State) - x shares the same generator indices!
-             x_constrained = parent_node.zonotope.restrict_generators(restrictions)
-        else:
-             z_constrained = z_input
-             x_constrained = parent_node.zonotope
-
-        # 3. Generate Action (Independent)
-        u_input = self._get_constrained_action(constraints)
+        # ...Or just call a helper that returns the NEXT Zonotope without creating the node yet?
+        # Accessing private method `_propagate` from DFS class is messy.
+        # We should probably expose `solver.propagate_one_step(node, action, z_poly)`?
+        # For now, inline the logic:
         
-        # 4. Combine State and Action
-        x_aligned, u_aligned = x_constrained.stack_independent(u_input)
+        # A. Recover Z
+        z_input = node.z_zonotope if node.z_zonotope else solver._get_constrained_z(node.constraints)
+        
+        # B. Restrict Z (if Polytope exists)
+        # TODO: Implement Polytope Restriction on Zonotope if needed for accurate forward prop?
+        # For now, just use the Z-bounds which encompass the polytope.
+        z_constrained = z_input 
+        
+        # C. Action Zonotope (Point)
+        u_zono = box_to_zonotope(u_sample, u_sample, source_type='action')
+        
+        # D. Stack
+        x_aligned, u_aligned = node.zonotope.stack_independent(u_zono)
         xu_input = x_aligned.concatenate([u_aligned], axis=-1)
         
-        # 5. Align Z
-        # Now we align the CARRIED z_constrained with the new system.
-        # Since z_constrained's generators are already a subset of x_constrained's generators (by ID),
-        # stack_independent might get confused if we don't treat them properly?
-        # NO. stack_independent assumes *disjoint* generators. 
-        # But here X and Z *share* generators.
-        # If we behave as if they are independent, we duplicate them -> ERROR.
-        
-        # We need a "Align Shared" or "Pass Through".
-        # If Z is already part of the history, we don't need to stack it?
-        # AbstractENN expects (xu, z).
-        # Inside AbstractENN, it concatenates xu and z.
-        # If they share history, concatenate should "just work" (inherit history)?
-        # Zonotope.concatenate logic:
-        # "Assuming aligned inputs, we just inherit the history of self."
-        # If we pass z_constrained (length K) and xu_input (length K+A).
-        # We need to PAD z_constrained to length K+A using zeros for the 'Action' columns?
-        # Yes.
-        
-        def pad_to_match(target_z: Zonotope, reference_shape_1: int) -> Zonotope:
-            pad_len = reference_shape_1 - target_z.generators.shape[1]
-            if pad_len > 0:
-                padding = jnp.zeros((target_z.generators.shape[0], pad_len, target_z.generators.shape[2]))
-                new_gens = jnp.concatenate([target_z.generators, padding], axis=1)
-                return Zonotope(target_z.center, new_gens, target_z.history) # History?
-            return target_z
-
-        # xu_input has [Shared_Z, Action_Gens].
-        # z_constrained has [Shared_Z].
-        # We pad Z to [Shared_Z, 0] to match xu.
-        
-        z_final = pad_to_match(z_constrained, xu_input.generators.shape[1])
-        # We must ensure z_final has the same history object to avoid validation errors if we added checks?
-        # For now, Zonotope.concatenate just trusts us and takes self.history.
-        # So we update z_final history to match xu_input?
-        z_final.history = xu_input.history # Hacky but effectively true (Z is subset)
-
-        # 6. Prepare Split Dictionary
-        split_dict = {k: list(v) for k, v in constraints.relu_splits.items()}
-        
-        # 7. Forward Pass
-        next_zonos = self.model(
-            xu_input, 
-            z_final, 
-            split_idxs=split_dict
-        )
-        
-        # 8. Create Child Nodes
-        for z in next_zonos:
-            self.push(SearchNode(
-                priority=parent_node.priority, 
-                timestep=parent_node.timestep + 1,
-                zonotope=z,
-                z_zonotope=z_constrained, # Pass the constrained Z forward as the new baseline
-                parent=parent_node,
-                constraints=constraints 
-            ))
-
-    def _refine(self, node: SearchNode):
-        if node.parent is None:
-            # Debug Root Safety
-            _, ub = node.zonotope.project_bounds(self.unsafe_h)
-            max_ub = float(jnp.max(ub))
-            print(f"  [Error] Root Node is unsafe. MaxProj={max_ub:.4f} > Thresh={self.unsafe_thresh}")
-            return
-
-        ranking = node.zonotope.get_sensitivity_ranking(self.unsafe_h)
-        if not ranking:
-            print("  [Warning] No sensitivity ranking found.")
-            return
-
-        # Stochastic Selection
-        # Filter to valid options
-        candidates = [r for r in ranking if r.gain > 1e-9]
-        if not candidates:
-            candidates = ranking[:1] # Fallback to best if all are zero
-
-        # Weighted sampling
-        weights = [r.gain for r in candidates]
-        best = random.choices(candidates, weights=weights, k=1)[0]
-        
-        if self.verbosity >= 2:
-            print(f"  -> {best.desc}")
-        
-        if best.source_type == 'action':
-            new_constraint_sets = self._generate_action_splits(node, best)
-        elif best.source_type == 'z':
-            new_constraint_sets = self._generate_z_splits(node.constraints, best)
-        elif best.source_type == 'relu':
-            new_constraint_sets = self._generate_relu_splits(node.constraints, best)
-        elif best.source_type == 'input':
-            if self.verbosity >= 1:
-                print(f"  [Skip] Splitting 'input' source not implemented yet (requires root refinement).")
-            return
+        # E. Align Z
+        pad_len = xu_input.generators.shape[1] - z_constrained.generators.shape[1]
+        if pad_len > 0:
+            padding = jnp.zeros((z_constrained.generators.shape[0], pad_len, z_constrained.generators.shape[2]))
+            new_gens = jnp.concatenate([z_constrained.generators, padding], axis=1)
+            z_final = Zonotope(z_constrained.center, new_gens, xu_input.history)
         else:
-            raise Exception(f"Unknown source type: {best.source_type}")
+            z_final = Zonotope(z_constrained.center, z_constrained.generators, xu_input.history)
             
-        # Record Split Type for Aggregation
-        self.split_type_map[node] = best.source_type
+        # F. Forward
+        # RRT doesn't split ReLUs? Or does it?
+        # Standard RRT is for concrete systems.
+        # For Robust RRT, we propagate the bundle.
+        # Minimal splitting? Let's assume no ReLU splits for now (DeepPoly default).
+        next_zonos = solver.model(xu_input, z_final, split_idxs={})
+        next_zono = next_zonos[0] # Should be 1 if no splits
         
-        # Re-Propagate
-        parent = node.parent
-        for new_const in new_constraint_sets:
-            # Pruning: Check mass before propagating
-            if new_const.probability_mass < 1e-6:
-                continue
-            self._propagate(parent, new_const)
+        # 4. Check Safety & Inverse Constraint
+        _, ub = next_zono.project_bounds(solver.unsafe_h)
+        if float(jnp.max(ub)) <= solver.unsafe_thresh:
+            # Safe!
+            priority = (-(node.timestep + 1), -node.constraints.probability_mass(solver.model.z_dim))
+            return [SearchNode(
+                priority=priority,
+                timestep=node.timestep + 1,
+                zonotope=next_zono,
+                z_zonotope=z_constrained, # Keep same Z
+                parent=node,
+                constraints=c_action
+            )]
+        else:
+            # Unsafe! Can we restrict Z?
+            # Constraint: h^T x <= thresh
+            # Linearize Z dependence: x(z) ~= c + G z_gens
+            # This is hard because x depends on z non-linearly through ReLUs?
+            # AbstractENN preserves linearity w.r.t Z generators?
+            # Yes, Zonotope structure preserves affine dependence on epsilon.
+            # x = center + Sum(gens * eps)
+            # Some eps correspond to Z.
+            
+            # Project constraint onto Z-space generators.
+            # h^T (c + G_z * eps_z + G_other * eps_other) <= thresh
+            # Worst case "other" noise?
+            # To be rigorous: h^T G_z * eps_z <= thresh - h^T c - max(h^T G_other eps_other)
+            
+            # 1. Separate generators
+            # We need to know which generators map to Z dimensions.
+            # This requires tracking "GeneratorGroup" closely.
+            # Using `flatten()` or similar?
+            # `project_gens` method on Zonotope?
+            
+            # Let's assume we can get linear constraint on eps_z.
+            # For now, return empty list (Killing branch) 
+            # UNLESS we implement the Inverse Set calculation fully.
+            # Given the complexity, maybe just "Pure RRT" that kills unsafe branches?
+            # "Probabilistic RRT": If unsafe, kill.
+            # The "Robust RRT" with inverse sets is Advanced.
+            
+            # For this step, let's implement the Pure RRT (Reject unsafe).
+            # Future: Inverse Set.
+            return []
+
+
 
     def compute_safe_probability(self, root_node: SearchNode) -> float:
         """
@@ -371,61 +274,54 @@ class ReachabilitySolver:
         if root_node is None:
             return 0.0
             
-        # 1. Post-Order Traversal to process children before parents
-        # We need to compute values bottom-up.
-        stack = [root_node]
-        visit_order = []
-        
-        # Standard iterative post-order (approximate: push children, then add to visit list reversed)
-        # Or just:
-        # Pre-order traversal, then reverse it? 
-        # Yes, children map allows this easily.
-        
-        # Traverse to find all reachable nodes from root
-        # (Note: self.children_map might contain nodes not in this subtree if we reuse solver? 
-        # But we usually clear solver. So assuming tree is clean.)
-        
-        # BFS/DFS to get all nodes
+        # 1. Collect all nodes in subtree via DFS
         traversal_stack = [root_node]
         all_nodes = []
+        visited = set()
+        
         while traversal_stack:
             curr = traversal_stack.pop()
+            if curr in visited:
+                continue
+            visited.add(curr)
             all_nodes.append(curr)
+            
             children = self.children_map.get(curr, [])
             for c in children:
                 traversal_stack.append(c)
                 
-        # Now iterate in reverse (bottom-up)
+        # 2. Iterate in reverse (Bottom-Up)
         node_values = {}
         
         for node in reversed(all_nodes):
-            # Check if leaf (safe or dead end)
+            # Base Case: Safe Leaf
             if node in self.safe_leaves:
-                node_values[node] = node.constraints.probability_mass
+                node_values[node] = node.constraints.probability_mass(self.model.z_dim)
                 continue
                 
             children = self.children_map.get(node, [])
             if not children:
-                # Dead end / Pruned
+                # Dead end / Pruned / Unsafe Leaf
                 node_values[node] = 0.0
                 continue
                 
-            # Compute based on children
+            # Recursive Step
             child_vals = [node_values.get(c, 0.0) for c in children]
             
             split_type = self.split_type_map.get(node, 'unknown')
             
             if split_type == 'action':
+                # Maximize over Action choice
                 val = max(child_vals)
             else:
-                # Z / ReLU / Unknown -> Sum
+                # Sum over Z / ReLU / Unknown (Probability Mass)
                 val = sum(child_vals)
                 
             node_values[node] = val
             
         return node_values.get(root_node, 0.0)
 
-    def get_best_action(self, default_action: np.ndarray = np.array([0.0])) -> Tuple[np.ndarray, float, bool]:
+    def get_best_action(self, default_action: Array) -> Tuple[Array, float, bool]:
         """
         Returns (action, total_safe_mass_lower_bound, is_verified_safe)
         """
@@ -435,87 +331,53 @@ class ReachabilitySolver:
         # 1. Compute Global Safe Probability Lower Bound
         total_safe_mass = self.compute_safe_probability(self.root)
         
-        # 2. Find Action
-        # We want the action that leads to this mass.
-        # The root itself connects to t=0 nodes (or is t=0).
-        # Wait, dev_main initializes Root at t=0. 
-        # The first "Step" propogates t=0 -> t=1. This creates children.
-        # This propagation is usually 1-to-1 unless we split the input state/action/z immediately?
-        # Actually `solve.step()` pops `current_node`.
-        # If Safe -> Propagate (t+1). Split Type = 'transition' (implicitly)
-        # If Unsafe -> Refine. Split Type = 'action'/'z'/etc.
-        
-        # If the Root was immediately Safe (rare), we propagate unique child at t=1.
-        # If the Root was Unsafe, we Refine it.
-        # So Root will have Children (the splits).
-        
-        # We trace down from Root, following the 'argmax' path for Action splits,
-        # and just taking the first/best path for 'sum' splits?
-        # Actually, for MPC we need the action at t=0.
-        # SearchNode at t=0 contains `constraints`.
-        # Initial constraints usually have Action [-3, 3].
-        # If we split Action at Root, we get children with [-3, 0], [0, 3].
-        # We pick the child with higher `compute_safe_probability`.
-        # We recurse until we find a child that represents a "Transition" (propagation to t=1).
-        # The constraints of that node define the action we commit to.
-        
+        # 2. Find Action by tracing the max-mass path for Action splits
         curr = self.root
-        best_mass = total_safe_mass
         
+        # We generally assume the "Action" decision happens at t=0 (before first propagation)
+        # But our SearchTree might split Action at any refinement step of the Root.
         while curr and curr.timestep == 0:
             children = self.children_map.get(curr, [])
             if not children:
-                # Dead end at t=0? No safe action found.
                 break
                 
             split_type = self.split_type_map.get(curr, 'unknown')
             
             if split_type == 'action':
-                # Pick best child
+                # Pick child with highest safe probability (ArgMax behavior)
                 best_child = max(children, key=self.compute_safe_probability)
                 curr = best_child
             elif split_type in ['z', 'relu', 'input']:
-                # The action is valid for ALL these scenarios?
-                # No, if we split on Z, we are essentially saying "The policy works for Z_a AND Z_b".
-                # The action bounds should be consistent/shared?
-                # Actually, `refine` might split Z, but the Action bounds on both children remain same.
-                # So ANY child (with mass > 0) represents the same Action constraint.
-                # We can just pick the one with most mass to follow? 
-                # Or just pick the first one?
+                # The action constraints are shared/consistent across these splits.
+                # We can pick any valid child to continue tracing constraints.
                 valid_children = [c for c in children if self.compute_safe_probability(c) > 0]
                 if not valid_children:
                     break
+                # Heuristic: Follow largest mass chunk?
                 curr = valid_children[0]
             else:
-                # Transition / Propagate?
-                # If we propagated, curr.timestep increases. Loop ends.
-                # But here we are inside existing nodes.
+                # Transition (t=0 -> t=1)
                 curr = children[0]
                 
-        # Now curr is the node we decided on.
-        # If curr.timestep > 0, it means we propagated.
-        # The PROPOSAL/ACTION is in the constraints of the node *before* propagation?
-        # `SearchNode` stores `constraints`.
-        # If we are at t=0, `constraints.action_bounds` defines our commit.
-        
         c = curr.constraints
         if c.action_bounds:
             mins, maxs = c.action_bounds
+            # Center of the interval
             action = (np.array(mins) + np.array(maxs)) / 2.0
+            return jnp.array(action), total_safe_mass, (total_safe_mass > 0.0)
         else:
-            action = default_action
-            
-        return action, total_safe_mass, (total_safe_mass > 0.0)
+            return default_action, total_safe_mass, (total_safe_mass > 0.0)
 
     def get_best_trajectory(self) -> List[Dict]:
         """
-        Returns a list of steps in the trajectory:
-        [{'timestep': t, 'action': a, 'interval': (min, max)}, ...]
-        from t=0 to leaf.
+        Returns a list of steps in the trajectory from t=0 to safety.
         """
         target_node = None
         if self.safe_leaves:
-            sorted_leaves = sorted(self.safe_leaves, key=lambda n: n.constraints.probability_mass, reverse=True)
+            # Pick leaf with highest mass? Or just any safe leaf?
+            # Ideally, the leaf that contributes to the 'best action' path.
+            # But just returning *a* safe path is fine for viz.
+            sorted_leaves = sorted(self.safe_leaves, key=lambda n: n.constraints.probability_mass(self.model.z_dim), reverse=True)
             target_node = sorted_leaves[0]
         elif self.best_node is not None:
             target_node = self.best_node
@@ -527,17 +389,12 @@ class ReachabilitySolver:
         path = []
         curr = target_node
         while curr is not None:
-            # We want to record the action taken to reach this node.
-            # Node at timestep t was reached by action at t-1.
-            # But SearchNode stores constraints including 'action_bounds' of that transition.
-            
-            if curr.timestep > 0: # Root (t=0) has no previous action
+            if curr.timestep > 0: 
                 c = curr.constraints
                 action_info = {'timestep': curr.timestep - 1, 'action': None, 'bounds': None}
                 
                 if c.action_bounds:
                     mins, maxs = c.action_bounds
-                    # Center
                     a_val = (np.array(mins) + np.array(maxs)) / 2.0
                     action_info['action'] = a_val
                     action_info['bounds'] = (mins, maxs)
@@ -549,132 +406,56 @@ class ReachabilitySolver:
             curr = curr.parent
             
         return list(reversed(path))
-        
-        # Logging is cleaner now
-        print(f"  -> {best.desc}")
-        
-        # Access via dot notation
-        if best.source_type == 'action':
-            new_constraint_sets = self._generate_action_splits(node, best)
-        elif best.source_type == 'z':
-            new_constraint_sets = self._generate_z_splits(node.constraints, best)
-        elif best.source_type == 'relu':
-            new_constraint_sets = self._generate_relu_splits(node.constraints, best)
-        elif best.source_type == 'input':
-            # Splitting initial state (x_0) requires restarting from root or carrying x constraints.
-            # For now, we skip to avoid crash.
-            print(f"  [Skip] Splitting 'input' source not implemented yet (requires root refinement).")
-            return
-        else:
-            raise Exception
-            
-        # Re-Propagate
-        parent = node.parent
-        for new_const in new_constraint_sets:
-            self._propagate(parent, new_const)
 
     def _generate_action_splits(self, node: SearchNode, result: SensitivityResult) -> List[ConstraintState]:
         current_c = node.constraints
         u_zono = self._get_constrained_action(current_c)
         lb, ub = u_zono.concrete_bounds()
         
-        # Access via object
         dim_idx = result.meta.get('local_index', 0)
         
-        # Attempt Calculated Split (Safety Margin)
-        # We want to find a split point 's' in concrete domain such that one side is safe.
-        
-        # 1. Get Generator info
-        # Global generator index usually corresponds to where 'action' block starts + local
+        # Calculate optimal split to fix 'w' impact
         global_gen_idx = result.indices[0] + dim_idx
-        
-        # 2. Project Generator onto Unsafe Vector
-        # w = h^T g_i
-        # We need the projection of this specific generator. 
-        # But wait, 'u_zono' is strictly the action part. 'node.zonotope' is the output.
-        # We need the impact on the OUTPUT.
-        # The 'result' object gave us the 'gain' based on the OUTPUT projection.
-        # We need to re-calculate 'w' exactly.
-        
-        # node.zonotope.generators: [Batch, N_err, OutDim]
-        # self.unsafe_h: [OutDim]
-        # projected: [Batch, N_err]
-        proj_gens = jnp.dot(node.zonotope.generators, self.unsafe_h) # [Batch, N_err]
-        w_vec = proj_gens[:, global_gen_idx] # [Batch]
-        
-        # We take the worst-case w (largest magnitude? No, valid w).
-        # Actually usually batch=1.
+        proj_gens = jnp.dot(node.zonotope.generators, self.unsafe_h) 
+        w_vec = proj_gens[:, global_gen_idx]
         w = float(w_vec[0])
-        
-        # 3. Calculate Required Reduction
-        # UB = CenterProj + Sum(|w_j|)
-        # We want NewUB <= Threshold
-        # NewUB = OldUB - |w| + NewContribution
-        # Gap = OldUB - Threshold
-        # We need Reduction >= Gap.
         
         _, current_ub = node.zonotope.project_bounds(self.unsafe_h)
         current_safe_gap = float(jnp.max(current_ub)) - self.unsafe_thresh
         
-        # If already safe, we shouldn't be here.
-        # If gap is huge > |w|, we can't fix it with this feature alone.
-        
         split_val = None
-        
-        # Epsilon for numerical stability
         SAFE_MARGIN = 1e-5
         target_reduction = current_safe_gap + SAFE_MARGIN
         
         if target_reduction < abs(w):
-            # It IS possible to fix it with this feature!
-            
-            # Derivation from plan:
-            # If w > 0: s <= 1 - R/w
-            # If w < 0: s >= -1 + R/|w|
-            
+            # Analytical Split
             if w > 0:
                 s_limit = 1.0 - target_reduction / w
-                # We want the interval [-1, s_limit] to be the SAFE one.
-                # So split point is s_limit.
-                # Valid s must be > -1.
-                if s_limit > -1.0:
-                    split_frac = s_limit
-                else:
-                    split_frac = 0.0 # Fallback
+                # Interval [-1, s_limit] is safe
+                split_frac = s_limit if s_limit > -1.0 else 0.0
             else: # w < 0
                 s_limit = -1.0 + target_reduction / abs(w)
-                # We want the interval [s_limit, 1] to be safe.
-                # So split point is s_limit.
-                if s_limit < 1.0:
-                    split_frac = s_limit
-                else:
-                    split_frac = 0.0
-                    
-            # Clamp split_frac to reasonable bounds to avoid slivers
-            # e.g. [-0.95, 0.95]
+                # Interval [s_limit, 1] is safe
+                split_frac = s_limit if s_limit < 1.0 else 0.0
+            
+            # Clip
             split_frac = max(-0.95, min(0.95, split_frac))
             
-            # Map split_frac [-1, 1] to Concrete Domain [L, R]
-            c_min = lb[0, dim_idx]
-            c_max = ub[0, dim_idx]
-            
+            # Map back to concrete
+            c_min = float(lb[0, dim_idx])
+            c_max = float(ub[0, dim_idx])
             split_val = c_min + (c_max - c_min) * (split_frac + 1.0) / 2.0
-            
-            print(f"    [Calculated Split] Gap={current_safe_gap:.4f}, w={w:.4f} -> SplitFrac={split_frac:.2f}")
-            
+            # print(f"    [Calculated Split] Gap={current_safe_gap:.4f}, w={w:.4f} -> SplitFrac={split_frac:.2f}")
         else:
-            # Cannot fix with single split, fallback to bisection
-            split_val = (lb[0, dim_idx] + ub[0, dim_idx]) / 2.0
-            # print(f"    [Bisection] Gap={current_safe_gap:.4f} > |w|={abs(w):.4f}")
+            # Fallback Bisection
+            split_val = (float(lb[0, dim_idx]) + float(ub[0, dim_idx])) / 2.0
 
         results = []
-        # Create Lower Half and Upper Half using split_val
         for (start, end) in [(lb, ub.at[:, dim_idx].set(split_val)), 
                              (lb.at[:, dim_idx].set(split_val), ub)]:
             
             min_t = tuple(start.flatten().tolist())
             max_t = tuple(end.flatten().tolist())
-            
             results.append(replace(current_c, action_bounds=(min_t, max_t)))
             
         return results
@@ -684,7 +465,7 @@ class ReachabilitySolver:
         lb, ub = z_zono.concrete_bounds()
         
         dim_idx = result.meta.get('local_index', 0)
-        mid = (lb[0, dim_idx] + ub[0, dim_idx]) / 2.0
+        mid = (float(lb[0, dim_idx]) + float(ub[0, dim_idx])) / 2.0
         
         results = []
         for (start, end) in [(lb, ub.at[:, dim_idx].set(mid)), 
@@ -692,7 +473,6 @@ class ReachabilitySolver:
             
             min_t = tuple(start.flatten().tolist())
             max_t = tuple(end.flatten().tolist())
-            
             results.append(replace(current_c, z_bounds=(min_t, max_t)))
             
         return results
@@ -701,34 +481,20 @@ class ReachabilitySolver:
         layer = result.meta.get('layer', 'unknown')
         idx = result.meta.get('index', -1)
         
-        # 1. Sanity Check
         if layer == 'unknown' or idx == -1:
             return []
 
-        # 2. Check Existing Constraints
         curr_layer_splits = current_c.relu_splits.get(layer, ())
+        existing_indices = {s[0] for s in curr_layer_splits}
         
-        # Extract just the indices that are already constrained
-        existing_constrained_indices = {s[0] for s in curr_layer_splits}
-        
-        if idx in existing_constrained_indices:
-            # The solver wants to split a neuron we have already fixed.
-            # This usually means the sensitivity gain is negligible (numerical noise)
-            # or the constraint didn't work. We skip to avoid infinite loops.
-            # print(f"  [Skip] Neuron {layer}[{idx}] is already constrained.")
+        if idx in existing_indices:
             return []
 
         results = []
-        
-        # 3. Generate Branches
         for status in ['active', 'inactive']:
-            # Append new split
             new_splits = curr_layer_splits + ((idx, status),)
-            
-            # Update dictionary
             new_map = current_c.relu_splits.copy()
             new_map[layer] = new_splits
-            
             results.append(replace(current_c, relu_splits=new_map))
             
         return results
@@ -736,7 +502,7 @@ class ReachabilitySolver:
     # --- Helpers ---
 
     def _get_constrained_action(self, c: ConstraintState) -> Zonotope:
-        # Default Action Bounds (Update these to your env specs)
+        # Default Action Bounds [1 dimension]
         default_min = jnp.array([-3.0]) 
         default_max = jnp.array([3.0])
         
@@ -747,15 +513,13 @@ class ReachabilitySolver:
         else:
             u_min, u_max = default_min, default_max
             
-        u_zono = box_to_zonotope(u_min, u_max)
-        # Log for sensitivity
-        u_zono.history = (GeneratorGroup('action', 0, u_zono.generators.shape[1]),)
-        return u_zono
+        return box_to_zonotope(u_min, u_max, source_type='action')
 
     def _get_constrained_z(self, c: ConstraintState) -> Zonotope:
-        # Default Z Bounds
-        default_min = jnp.array([-3.0, -3.0, -3.0, -3.0]) 
-        default_max = jnp.array([3.0, 3.0, 3.0, 3.0])
+        # Initial Z Bounds (from model dim)
+        z_dim = self.model.z_dim
+        default_min = jnp.full((z_dim,), -3.0)
+        default_max = jnp.full((z_dim,), 3.0)
         
         if c.z_bounds:
             mins, maxs = c.z_bounds
@@ -764,6 +528,4 @@ class ReachabilitySolver:
         else:
             z_min, z_max = default_min, default_max
             
-        z_zono = box_to_zonotope(z_min, z_max)
-        z_zono.history = (GeneratorGroup('z', 0, z_zono.generators.shape[1]),)
-        return z_zono
+        return box_to_zonotope(z_min, z_max, source_type='z')

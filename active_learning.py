@@ -21,6 +21,12 @@ from src.search import ReachabilitySolver, SearchNode, ConstraintState
 from main import train_enn
 from util import TensorboardLogger
 
+class DummyLogger:
+    def __init__(self):
+        self.writer = self
+    def add_scalar(self, *args): pass
+    def close(self): pass
+
 # Configuration
 ENV_NAME = 'InvertedPendulum-v5'
 MAX_EPOCHS = 50
@@ -31,6 +37,7 @@ TARGET_SAFE_PROB = 0.8 # Early stopping for MPC
 INITIAL_STEPS = 500
 MPC_EPISODES = 5
 LOOPS = 5
+MAX_NODES = 500
 
 def get_mpc_action(model: AbstractENN, obs: np.ndarray, unsafe_vec: jax.Array, unsafe_thresh: float):
     """
@@ -66,7 +73,7 @@ def get_mpc_action(model: AbstractENN, obs: np.ndarray, unsafe_vec: jax.Array, u
     solver.push(root)
     
     start_time = time.time()
-    step_limit = 500
+    step_limit = MAX_NODES
     steps = 0
     
     while solver.step():
@@ -103,7 +110,8 @@ def get_mpc_action(model: AbstractENN, obs: np.ndarray, unsafe_vec: jax.Array, u
 
 def run_active_learning():
     # 0. Setup Logging
-    logger = TensorboardLogger('./runs/', 'active_learning')
+    # logger = TensorboardLogger('./runs/', 'active_learning')
+    logger = DummyLogger()
     mpc_logs = []
     
     # 1. Initialize Environment and Data
@@ -142,6 +150,10 @@ def run_active_learning():
             enn, dataset, max_epochs=MAX_EPOCHS, batch_size=BATCH_SIZE, rngs=rngs,
             logger=logger, global_step=global_step
         )
+        
+        # Save Model
+        with open('model.pkl', 'wb') as f:
+            pickle.dump(enn, f)
         
         # B. Convert to Abstract Model
         abstract_model = AbstractENN.from_concrete(enn)

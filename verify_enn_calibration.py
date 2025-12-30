@@ -1,60 +1,136 @@
-import dill as pickle
+import gymnasium as gym
 import jax
+import jax.numpy as jnp
 import numpy as np
-import matplotlib.pyplot as plt
+import dill as pickle
 from flax import nnx
-from src.eval import compute_val_diagnostics
-from src.data import TrajectoryDataset
-from pathlib import Path
+from typing import Tuple, List
+import polars as pl
+from tqdm import tqdm
 
-def verify_calibration(model_path='model.pkl', data_path='active_learning_data.pkl'):
-    print(f"Loading model from {model_path}...")
-    with open(model_path, 'rb') as f:
-        model = pickle.load(f)
+from src.data import collect_data, TrajectoryDataset
+from src.net import ENN
+
+# Metric Helpers
+def compute_coverage_and_rmse(
+    model: ENN, 
+    dataset: TrajectoryDataset, 
+    key: jax.Array, 
+    num_samples: int = 100
+) -> Tuple[float, float, float]:
+    """
+    Computes RMSE and 95% Coverage Probabilities.
+    Coverage is defined as the fraction of labels falling within mu +/- 1.96 * sigma.
+    """
+    
+    states = dataset.states
+    actions = dataset.actions
+    next_states = dataset.next_states
+    
+    # Batch processing
+    batch_size = 128
+    N = len(states)
+    
+    squared_errors = []
+    coverage_counts = 0
+    total_points = 0
+    cis_lengths = []
+    
+    print(f"Evaluating Calibration on {N} samples...")
+    
+    for i in tqdm(range(0, N, batch_size)):
+        batch_s = jnp.array(states[i:i+batch_size])
+        batch_a = jnp.array(actions[i:i+batch_size])
+        batch_next_s = next_states[i:i+batch_size]
         
-    print(f"Loading data from {data_path}...")
-    with open(data_path, 'rb') as f:
-        dataset: TrajectoryDataset = pickle.load(f)
+        # Prepare inputs
+        # ENN expects (x, z). x is [state, action]
+        batch_x = jnp.concatenate([batch_s, batch_a], axis=-1)
+        B = batch_x.shape[0]
         
-    # Split data to get validation set
-    _, val_ds = dataset.split(0.15)
-    print(f"Validation Set: {val_ds.lengths.sum()} transitions")
+        # Sample Z: [B, num_samples, z_dim]
+        key, subkey = jax.random.split(key)
+        z_samples = jax.random.normal(subkey, (B, num_samples, model.z_dim))
+        
+        # Vectorize model call over samples
+        # model((B, D), (B, Z)) -> (B, Out)
+        # We need (B, S, Out)
+        
+        def predict_ensemble(x_b, z_b_samples):
+            # x_b: (D,)
+            # z_b_samples: (S, Z_dim)
+            # broadcast x_b
+            x_b_expanded = jnp.broadcast_to(x_b, (num_samples, x_b.shape[0]))
+            return model(x_b_expanded, z_b_samples)
+            
+        # Vmap over batch
+        batch_preds = jax.vmap(predict_ensemble)(batch_x, z_samples) # (B, S, Out)
+        
+        # Compute Stats
+        means = jnp.mean(batch_preds, axis=1) # (B, Out)
+        stds = jnp.std(batch_preds, axis=1)   # (B, Out)
+        
+        # RMSE Contribution
+        current_sq_err = np.sum((means - batch_next_s)**2)
+        squared_errors.append(current_sq_err)
+        total_points += B * batch_next_s.shape[1] # dimensions count? RMSE is usually per-dimension or average
+        
+        # Coverage (95% CI = mean +/- 1.96 * std)
+        # We check per dimension
+        lower = means - 1.96 * stds
+        upper = means + 1.96 * stds
+        
+        in_bounds = (batch_next_s >= lower) & (batch_next_s <= upper)
+        coverage_counts += np.sum(in_bounds)
+        
+        # CI Length
+        cis_lengths.append(np.sum(upper - lower))
+
+    total_samples = N * states.shape[1] # Total scalar predictions
+    rmse = np.sqrt(sum(squared_errors) / total_samples)
+    coverage = coverage_counts / total_samples
+    avg_ci_width = sum(cis_lengths) / total_samples
     
-    rngs = nnx.Rngs(params=0, epistemic=42)
+    return rmse, coverage, avg_ci_width
+
+def main():
+    ENV_NAME = 'InvertedPendulum-v5'
+    MODEL_PATH = 'model.pkl'
     
-    print("Computing diagnostics...")
-    metrics = compute_val_diagnostics(
-        model, 
-        val_ds, 
-        rngs, 
-        id_batch=1024,
-        n_samples=50 # Robust sampling
-    )
+    # 1. Load Model
+    print(f"Loading model from {MODEL_PATH}...")
+    try:
+        with open(MODEL_PATH, 'rb') as f:
+            model = pickle.load(f)
+    except FileNotFoundError:
+        print("Model file not found! Please run active_learning.py first to train a model.")
+        return
+
+    # 2. Collect Validation Data
+    print("Collecting validation data...")
+    val_env = gym.make(ENV_NAME)
+    (states, actions, next_states, dones), _ = collect_data(val_env, steps=2000)
+    val_dataset = TrajectoryDataset(states, actions, next_states, dones)
     
-    print("\n=== Calibration & Uncertainty Metrics ===")
-    print(f"Mean ID Sigma:       {metrics['val/mean_sigma_id']:.4f}")
-    print(f"Mean OOD Sigma:      {metrics['val/mean_sigma_ood']:.4f}")
-    print(f"OOD/ID Ratio:        {metrics['val/sigma_ood_over_id']:.2f} (Should be >> 1)")
-    print(f"AUROC (ID vs OOD):   {metrics['val/auroc_ood']:.4f} (Should be > 0.5)")
-    print(f"ECE (Sigma vs Err):  {metrics['val/calib_ece_sigma_vs_error']:.4f} (Should be low, < 0.1)")
-    print(f"L2 Error (ID):       {metrics['val/mean_id_error_l2']:.4f}")
+    # 3. Evaluate
+    key = jax.random.key(0)
+    rmse, coverage, ci_width = compute_coverage_and_rmse(model, val_dataset, key)
     
-    # Save a simple plot of Error vs Sigma
-    # We need to re-run a small batch to plot, as compute_val_diagnostics returns aggregates.
-    # Or just trust the printed metrics.
+    print("\n" + "="*40)
+    print(f"Validation Results ({ENV_NAME})")
+    print("="*40)
+    print(f"RMSE:             {rmse:.4f}")
+    print(f"95% Coverage:     {coverage:.4%}")
+    print(f"Avg CI Width:     {ci_width:.4f}")
+    print("="*40)
     
-    # Basic Check:
-    if metrics['val/calib_ece_sigma_vs_error'] > 0.2:
-        print("\n[WARNING] Model appears poorly calibrated (High ECE). Search reliability is low.")
-    elif metrics['val/auroc_ood'] < 0.6:
-        print("\n[WARNING] Model cannot distinguish OOD data. Epistemic uncertainty is weak.")
+    if coverage < 0.80:
+        print("\n[WARNING] Model is significantly UNDER-confident or biased (Coverage < 80%).")
+        print("Search Optimization guarantees likely invalid.")
+    elif coverage > 0.99:
+        print("\n[WARNING] Model is OVER-confident (Coverage > 99%). CIs are too wide.")
     else:
-        print("\n[PASS] Model calibration looks reasonable.")
+        print("\n[OK] Model calibration looks reasonable.")
 
 if __name__ == "__main__":
-    import os
-    if not os.path.exists('model.pkl'):
-        # Just in case model wasn't saved in previous runs (we fixed it but maybe user wants to run this now)
-        print("model.pkl not found. Please run active_learning.py first.")
-    else:
-        verify_calibration()
+    main()
